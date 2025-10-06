@@ -1,0 +1,121 @@
+import streamlit as st
+import pandas as pd
+import re
+import time
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from bs4 import BeautifulSoup
+
+st.set_page_config(page_title="실시간 타임테이블 비교 도구", layout="wide")
+
+st.title("🏌️‍♂️ 실시간 타임테이블 비교 도구 (골프존카운티)")
+
+st.write("""
+이 도구는 **골프존카운티 예약 페이지**의 실시간 정보를 자동으로 크롤링하고,  
+사용자가 붙여넣은 타임테이블 텍스트와 비교합니다.
+""")
+
+# 입력 UI
+url = st.text_input("🔗 골프존카운티 예약 페이지 URL 입력:")
+user_text = st.text_area("📋 내 타임테이블 텍스트를 붙여넣으세요:", height=300)
+
+if st.button("🚀 비교 시작"):
+    if not url or not user_text:
+        st.warning("URL과 텍스트를 모두 입력해주세요.")
+        st.stop()
+
+    # 1️⃣ Selenium으로 페이지 크롤링
+    st.info("⏳ 홈페이지에서 예약 데이터를 불러오는 중입니다... (약 10초 소요)")
+    try:
+        options = Options()
+        options.add_argument("--headless")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+
+        driver = webdriver.Chrome(options=options)
+        driver.get(url)
+        time.sleep(5)
+
+        html = driver.page_source
+        driver.quit()
+
+        soup = BeautifulSoup(html, "html.parser")
+        items = soup.find_all("li", class_="selectGc")
+
+        site_data = []
+        for item in items:
+            source = item.get("data-cc_name", "").strip()
+            course = item.get("data-course_name", "").strip()
+            time_ = item.get("data-tee_time", "").strip()
+            price = item.get("data-price4", "").strip()
+            if all([course, time_, price]):
+                site_data.append([source, course, time_, price])
+
+        df_site = pd.DataFrame(site_data, columns=["source", "course", "time", "price"])
+        st.success(f"✅ {len(df_site)}개의 슬롯을 가져왔습니다.")
+        st.dataframe(df_site)
+
+    except Exception as e:
+        st.error(f"크롤링 중 오류 발생: {e}")
+        st.stop()
+
+    # 2️⃣ 텍스트 데이터 파싱
+    st.info("📋 텍스트 데이터 파싱 중...")
+    try:
+        pattern = re.compile(r"(\d{2,4})\s*카포\s*([\d.]+)만")
+        lines = user_text.splitlines()
+
+        parsed = []
+        current_date, current_course = None, None
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # 날짜 감지
+            if re.match(r"^\d{1,2}/\d{1,2}", line):
+                current_date = line
+            # 코스명 감지
+            elif line.startswith("*"):
+                current_course = re.sub(r"[*()]|\d+인|마감", "", line).strip()
+            else:
+                matches = pattern.findall(line)
+                for t, p in matches:
+                    time_str = f"{t[:2]}:{t[2:]}" if len(t) == 4 else f"{t[:2]}:{t[2:]}"
+                    price_val = float(p) * 10000
+                    parsed.append([current_date, current_course, time_str, int(price_val)])
+
+        df_user = pd.DataFrame(parsed, columns=["date", "course", "time", "price"])
+        st.success(f"✅ {len(df_user)}개의 내 타임테이블 항목 파싱 완료.")
+        st.dataframe(df_user)
+
+    except Exception as e:
+        st.error(f"텍스트 파싱 중 오류 발생: {e}")
+        st.stop()
+
+    # 3️⃣ 비교
+    st.info("🔍 데이터 비교 중...")
+    try:
+        df_site["price"] = pd.to_numeric(df_site["price"], errors="coerce")
+        df_compare = pd.merge(
+            df_user, df_site,
+            how="outer",
+            on=["course", "time"],
+            suffixes=("_my", "_site")
+        )
+
+        def compare_status(row):
+            if pd.isna(row["price_my"]): return "홈페이지에만 있음"
+            if pd.isna(row["price_site"]): return "내 데이터에만 있음"
+            if row["price_my"] != row["price_site"]: return "가격 다름"
+            return "일치"
+
+        df_compare["비교결과"] = df_compare.apply(compare_status, axis=1)
+        st.success("✅ 비교 완료!")
+        st.dataframe(df_compare.sort_values(["course", "time"]).reset_index(drop=True), use_container_width=True)
+
+        csv = df_compare.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("📥 비교 결과 CSV 다운로드", data=csv, file_name="비교결과.csv", mime="text/csv")
+
+    except Exception as e:
+        st.error(f"비교 중 오류 발생: {e}")
